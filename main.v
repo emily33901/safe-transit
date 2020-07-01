@@ -461,61 +461,62 @@ fn main() {
 	fp.description('Tcp relay')
 	fp.skip_executable()
 	
-	// Apps
-	is_echo := fp.bool('echo', `c`, false, 'echo app')
-	is_ping := fp.bool('ping', `g`, false, 'ping app')
-	is_relay := fp.bool('relay', `r`, false, 'Run relay app')
-	is_endpoint := fp.bool('endpoint', `e`, false, 'Run endpoint app')
-
 	// config
-	relay_ip := fp.string('ip', `i`, '', 'IP of the relay (if running in endpoint mode)')
+	relay_ip := fp.string('ip', `i`, '', 'IP+port of the relay (if running endpoint app)')
 	relay_port := fp.int('relay_port', `p`, 7778, 'Port of the relay channel (if running in relay mode)')
 	app_port := fp.int('app_port', `a`, 7777, 'Port of the application')
 	
-	_ := fp.finalize() or {
+	// We only want one free arg for the app name
+	fp.limit_free_args_to_exactly(1)
+	fp.arguments_description('<app name (relay | endpoint | echo | ping)>')
+	
+	other_args := fp.finalize() or {
 		println(err)
 		println(fp.usage())
 		return
 	}
 
-	apps := int(is_relay) + int(is_endpoint) + int(is_echo) + int(is_ping)
-	if apps > 1 || apps == 0 {
-		println(fp.usage())
-		println('Can only be one app at a time!')
-		return
+	match other_args[0] {
+		'echo' {
+			echo_app(Args{
+				relay_port: relay_port
+				app_port: app_port
+				relay_ip: relay_ip
+			})?
+		}
+
+		'ping' {
+			ping_app(Args{
+				relay_port: relay_port
+				app_port: app_port
+				relay_ip: relay_ip
+			})?
+		}
+
+		'relay' {
+			mut app := new_relay_app(Args{
+				relay_port: relay_port
+				app_port: app_port
+				relay_ip: relay_ip
+			})
+			app.run()?
+		}
+
+		'endpoint' {
+			mut app := new_endpoint_app(Args{
+				relay_port: relay_port
+				app_port: app_port
+				relay_ip: relay_ip
+			})
+			app.run()?
+		}
+
+		else {
+			println(fp.usage())
+			println('Unknown app "${other_args[0]}"')
+			return
+		}
 	}
 
-	if is_echo {
-		echo_app(Args{
-			relay_port: relay_port
-			app_port: app_port
-			relay_ip: relay_ip
-		})?
-	}
-
-	if is_ping {
-		ping_app(Args{
-			relay_port: relay_port
-			app_port: app_port
-			relay_ip: relay_ip
-		})?
-	}
-
-	if is_relay {
-		mut app := new_relay_app(Args{
-			relay_port: relay_port
-			app_port: app_port
-			relay_ip: relay_ip
-		})
-		app.run()?
-	}
-	
-	if is_endpoint {
-		mut app := new_endpoint_app(Args{
-			relay_port: relay_port
-			app_port: app_port
-			relay_ip: relay_ip
-		})
-		app.run()?
-	}
+	println('Shutting down...')
 }
