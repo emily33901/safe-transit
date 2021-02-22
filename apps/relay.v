@@ -4,72 +4,62 @@ import time
 import sync2
 import sync2.atomic3
 import sync.atomic2
-import emily33901.net
-
-struct Stats {
-	frontside_read u64
-	frontside_wrote u64
-
-	backside_read u64
-	backside_wrote u64
-}
+import sync
+import net
 
 pub struct RelayApp {
-	args Args
-	buffer []byte
+	args                Args
 mut:
-	pool &sync2.YieldingPoolProcessor
-	listen net.TcpListener
-	client_mutex &sync2.Mutex
-	client_conns map[string]net.TcpConn
-	endpoint_mutex &sync2.Mutex
-	endpoint_conn net.TcpConn
-	last_client_index int
-	stats &Stats
+	pool                 &sync2.TaskPool
+	listen               &net.TcpListener = voidptr(0)
+	client_mutex         sync.Mutex
+	client_conns         map[int]&net.TcpConn
+	endpoint_conn        &net.TcpConn = voidptr(0)
+	endpoint_write_queue chan Packet
+	last_client_index    int
+	stats                &Stats
 }
 
-pub fn new_relay(a Args) RelayApp {
-	return RelayApp {
+pub fn new_relay(a Args) &RelayApp {
+	return &RelayApp{
 		args: a
-		buffer: []byte{ len: data_size, cap: data_size + header_size, init: 0 }
-		pool: sync2.new_pool_processor({ maxjobs: 0 })
-		client_mutex: sync2.new_mutex()
-		endpoint_mutex: sync2.new_mutex()
-		stats: &Stats {}
+		pool: sync2.new_pool_processor({
+			maxjobs: max_jobs
+		})
+		client_mutex: sync.new_mutex()
+		stats: &Stats{}
+		endpoint_write_queue: chan Packet{cap:max_write_queue_size}
 	}
 }
 
-fn (mut app RelayApp) print_stats() {
-	frontside_read := u64(atomic3.atomic_exchange(&app.stats.frontside_read, 0)) / 1024
-	frontside_wrote := u64(atomic3.atomic_exchange(&app.stats.frontside_wrote, 0)) / 1024
-
-	backside_read := u64(atomic3.atomic_exchange(&app.stats.backside_read, 0)) / 1024
-	backside_wrote := u64(atomic3.atomic_exchange(&app.stats.backside_wrote, 0)) / 1024
-
-	println('stats: frontside: ${frontside_read}Kbit/${frontside_wrote}Kbit')
-	println('stats:  backside: ${backside_read}Kbit/${backside_wrote}Kbit')
-	println('stats:      neck: ${backside_read}Kbit/${frontside_wrote}Kbit ${frontside_read}Kbit/${backside_wrote}Kbit')
+fn (mut app RelayApp) queue_endpoint_data(data []byte) {
+	app.endpoint_write_queue <- packet_from_data(data)
+	atomic2.add_u64(&app.stats.behind, 1)
 }
 
-fn (mut app RelayApp) disconnect_client(id string) ? {
-	app.client_mutex.lock()
-	defer { app.client_mutex.unlock() }
+fn (mut app RelayApp) disconnect_client(id int) ? {
+	// queue drop packet to be sent
+	app.queue_endpoint_data(build_drop_packet(id))
 
+	app.client_mutex.@lock()
+	defer {
+		app.client_mutex.unlock()
+	}
 	if id in app.client_conns.keys() {
-		c := app.client_conns[id]
+		// if in the client list then remove
+		mut c := app.client_conns[id]
 		c.close()?
-		app.client_conns.delete(id)
-	
-		send_drop_packet(app.endpoint_conn, id.int())
-	}
-
+		app.client_conns.delete_1(id)
+	} 
 	return none
 }
 
 [inline]
-fn (mut app RelayApp) client(id string) ?net.TcpConn {
-	app.client_mutex.lock()
-	defer { app.client_mutex.unlock() }
+fn (mut app RelayApp) client(id int) ?&net.TcpConn {
+	app.client_mutex.@lock()
+	defer {
+		app.client_mutex.unlock()
+	}
 	if id in app.client_conns {
 		return app.client_conns[id]
 	}
@@ -78,176 +68,197 @@ fn (mut app RelayApp) client(id string) ?net.TcpConn {
 
 fn (mut app RelayApp) shutdown_pool(err string, code int) {
 	println('shutdown: $code $err: shutting down pool')
-	app.endpoint_conn.close() or { 
+	app.endpoint_conn.close() or {
 		println('shutdown: $err $errcode: shutdown conn failed')
 	}
 	app.pool.shutdown()
+	app.endpoint_write_queue.close()
 }
 
 struct RelayClientFrameTaskContext {
-	id string
+	id     int
+mut:
 	buffer []byte
 }
 
 [inline]
-fn (mut app RelayApp) client_frame(id string, buffer []byte) ? {
-	packet_header := &PacketHeader(buffer.data)
-	c := app.client(id) or {
+fn (mut app RelayApp) client_frame(id int, mut buffer []byte) ? {
+	mut packet_header := &PacketHeader(buffer.data)
+	mut c := app.client(id) or {
 		return error('No client with id exists anymore')
 	}
 	// Read into the buffer after the space for the packet header
-	read := c.read_into(mut buffer[header_size..]) or {
+	read := c.read(mut buffer[header_size..]) or {
 		// Nothing to read from this client so move on
-		if errcode == net.err_read_timed_out_code {
+		if errcode == net.err_timed_out_code {
 			return none
 		}
-
 		println('read: [$id] $errcode $err: Disconnecting client')
-		app.disconnect_client(id)
-
+		app.disconnect_client(id)?
 		return error('Disconnection')
 	}
-
-	if read == 0 { return none }
-	// println('read: [$id]: $read')
-
+	if read == 0 {
+		return none
+	}
 	atomic2.add_u64(&app.stats.frontside_read, read)
-
 	// Setup the packet header for this client
-	packet_header.id = id.int()
+	packet_header.id = id
 	packet_header.size = read
 	packet_header.@type = .data
-	// Send the data on its way
-	// Make sure we have the endpoint mutex so we dont screw up
-	// someone elses packet
-	app.endpoint_mutex.lock()
-	defer { app.endpoint_mutex.unlock() }
-	for {
-		app.endpoint_conn.write(buffer[..header_size+read]) or {
-			if errcode == net.err_write_timed_out_code {
-				// sync2.thread_yield()
-				continue
-			}
-			// Something tragic happened...
-			app.shutdown_pool(err, errcode)
-			return error_with_code(err, errcode)
-		}
-		break
-	}
 
-	atomic2.add_u64(&app.stats.backside_wrote, header_size+read)
+	// queue this data to be sent to endpoint
+	// TODO really dont clone these things its abhorent
+	app.queue_endpoint_data(buffer[..header_size+read].clone())
 
 	return none
 }
 
+[inline]
+fn (mut app RelayApp) endpoint_write_frame() ? {
+	for {
+		packet := <-app.endpoint_write_queue or {
+			if app.pool.has_shutdown() {
+				return none
+			}
+		}
+
+		packet.check()
+		mut sent := 0
+		for sent != packet.data.len {
+			sent += app.endpoint_conn.write(packet.data) or {
+				if errcode == net.err_timed_out_code {
+					// println('endpoint_write_frame: blocked')
+					continue
+				}
+				// Something tragic happened...
+				return error_with_code(err, errcode)
+			}
+		}
+
+		atomic2.add_u64(&app.stats.backside_wrote, packet.data.len)
+
+		packet.free()
+		atomic2.sub_u64(&app.stats.behind, 1)
+	}
+	return none
+}
+
 struct RelayEndpointFrameTaskContext {
+mut:
 	buffer []byte
 }
 
 [inline]
-fn (mut app RelayApp) endpoint_frame(buffer []byte) ? {
+fn (mut app RelayApp) endpoint_frame(mut buffer []byte) ? {
 	mut packet_header := &PacketHeader(buffer.data)
-
 	for {
 		// First just read the header so we know how much to then read
-		mut read := app.endpoint_conn.read_into(mut buffer[..header_size]) or {
-			if errcode == net.err_read_timed_out_code {
-			// Nothing to read right now
-				break
+		mut read := 0
+		for read != header_size {
+			read += app.endpoint_conn.read(mut buffer[read..header_size]) or {
+				if errcode == net.err_timed_out_code {
+					// Nothing to read right now
+					continue
+				}
+				// Something tragic happened...
+				return error_with_code(err, errcode)
 			}
-			// Something tragic happened...
-			return error_with_code(err, errcode)
 		}
-		id := packet_header.id.str()
+		id := packet_header.id
 		size := packet_header.size
+
+		if int(packet_header.@type) > 2 {
+			println('endpoint: Invalid packet type ${u32(packet_header.@type)}')
+			return error('invalid packet type from endpoint: ${u32(packet_header.@type)}')
+		}
+
 		match packet_header.@type {
 			.data {
 				if size == 0 {
 					println('endpoint: [$id]: 0-size packet')
-					id.free()
 					return none
 				}
-
 				// Read all bytes of this payload into the buffer
 				read = 0
 				for read < size {
-					read += app.endpoint_conn.read_into(mut buffer[header_size..header_size+size]) or {
-						if errcode == net.err_read_timed_out_code {
+					read += app.endpoint_conn.read(mut buffer[header_size+read..header_size + size]) or {
+						if errcode == net.err_timed_out_code {
 							continue
 						}
 						// Something tragic happened...
 						return error_with_code(err, errcode)
 					}
 				}
-
-				atomic2.add_u64(&app.stats.backside_read, size+header_size)
-
+				atomic2.add_u64(&app.stats.backside_read, size + header_size)
 				// If the id is not in our list then just chuck the data away
 				// and tell the endpoint to not send us anymore please
 				if id !in app.client_conns {
 					println('endpoint: [$id]: doesnt exist')
-					app.disconnect_client(id)
-					id.free()
+					app.disconnect_client(id)?
 					continue
 				}
 				// Send data back to client
 				for {
-					app.client_conns[id].write(buffer[header_size..header_size+size]) or {
-						if errcode == net.err_write_timed_out_code {
+					app.client_conns[id].write(buffer[header_size..header_size + size]) or {
+						if errcode == net.err_timed_out_code {
 							// TODO dont do this it will block everyone else
 							continue
 						}
 						println('write: [$id] $errcode $err: Disconnecting client')
-						app.disconnect_client(id)
+						app.disconnect_client(id)?
 						break
 					}
 					break
 				}
-				atomic2.add_u64(&app.stats.frontside_wrote, size+header_size)
-				id.free()
+				atomic2.add_u64(&app.stats.frontside_wrote, size + header_size)
 			}
 			.drop {
 				println('drop: [$id]: Dropping by request')
-				app.disconnect_client(id)
+				app.disconnect_client(id)?
 			}
 		}
+		if app.pool.has_shutdown() {
+			return none
+		}
 	}
-
+	println('yielded')
 	return none
 }
 
 [inline]
 fn (mut app RelayApp) accept_frame() {
 	// Try and accept a connection
-	conn := app.listen.accept() or {
+	mut conn := app.listen.accept() or {
 		// no connection - cleanup for the compiler
 		err.free()
 		return
 	}
 
-	// We got a connection
+	conn.set_read_timeout(net.no_timeout)
+	conn.set_write_timeout(net.no_timeout)
 
+	// We got a connection
 	// This is sync becuase we are the only task to touch this
 	app.last_client_index++
 	println('connect: [$app.last_client_index] new')
+	id := app.last_client_index
 
-	id := '$app.last_client_index'
-	
-	app.client_mutex.lock()
+	app.client_mutex.@lock()
 	app.client_conns[id] = conn
 	app.client_mutex.unlock()
 
-	app.pool.add_task(fn (p &sync2.YieldingPoolProcessor, t &sync2.Task, tid int) sync2.TaskResult {
+	app.pool.add_task(fn (t &sync2.Task, tid int) sync2.TaskResult {
 		mut a := &RelayApp(t.item)
 		mut ctx := &RelayClientFrameTaskContext(t.context)
-		a.client_frame(ctx.id, ctx.buffer) or {
+		// sync2.set_thread_desc(sync2.thread_id(), 'client_frame[$ctx.id]')
+		a.client_frame(ctx.id, mut ctx.buffer) or {
 			// Error happened so we are done with this client
 			// TODO we need to free memory here
 			println('client: $err $errcode: finished')
 			return .finished
 		}
 		return .yield
-	}, app, voidptr(&RelayClientFrameTaskContext {
+	}, app, voidptr(&RelayClientFrameTaskContext{
 		id: id
 		buffer: new_data_buffer()
 	}))
@@ -255,14 +266,11 @@ fn (mut app RelayApp) accept_frame() {
 
 pub fn (mut app RelayApp) run() ? {
 	println('Relay starting - listening to clients on $app.args.app_port and endpoint on $app.args.relay_port')
-
 	// Create listen sockets for the endpoint and clients
 	app.listen = net.listen_tcp(app.args.app_port)?
 	app.listen.set_accept_timeout(500 * time.millisecond)
-	
 	mut endpoint_listen := net.listen_tcp(app.args.relay_port)?
 	endpoint_listen.set_accept_timeout(1 * time.second)
-	
 	for {
 		// Wait for the endpoint to connect
 		println('Waiting for endpoint...')
@@ -271,60 +279,68 @@ pub fn (mut app RelayApp) run() ? {
 				println('Waiting for endpoint...')
 				continue
 			}
+			app.endpoint_conn.sock.set_option_int(.send_buf_size, tcp_buffer_size)?
+			app.endpoint_conn.sock.set_option_int(.recieve_buf_size, tcp_buffer_size)?
+
 			break
 		}
-	
 		println('Got endpoint - pumping!')
-
+		app.pool.add_task(fn (t &sync2.Task, tid int) sync2.TaskResult {
+			mut a := &RelayApp(t.item)
+			// sync2.set_thread_desc(sync2.thread_id(), 'endpoint_write_frame')
+			a.endpoint_write_frame() or {
+				a.shutdown_pool(err, errcode)
+				println('endpoint_write_frame: $err $errcode: finished')
+				return .finished
+			}
+			return .yield
+		}, app, voidptr(0))
 		// Task to listen for new clients
-		app.pool.add_task(
-			fn (p &sync2.YieldingPoolProcessor, t &sync2.Task, tid int) sync2.TaskResult {
-				mut a := &RelayApp(t.item)
-				// println('accept: frame')
-				a.accept_frame()
-				return .yield
-			}, app, voidptr(0)
-		)
-
-		// task to listen to endpoint
-		app.pool.add_task(
-			fn (p &sync2.YieldingPoolProcessor, t &sync2.Task, tid int) sync2.TaskResult {
+		app.pool.add_task(fn (t &sync2.Task, tid int) sync2.TaskResult {
+			mut a := &RelayApp(t.item)
+			// println('accept: frame')
+			// sync2.set_thread_desc(sync2.thread_id(), 'accept_frame')
+			a.accept_frame()
+			return .yield
+		}, app, voidptr(0))
+		// Task to listen to endpoint
+		app.pool.add_task(fn (t &sync2.Task, tid int) sync2.TaskResult {
 			mut a := &RelayApp(t.item)
 			mut ctx := &RelayEndpointFrameTaskContext(t.context)
 			// println('endpoint: frame')
-			a.endpoint_frame(ctx.buffer) or {
-				// Error happened so we are done with this client
+			// sync2.set_thread_desc(sync2.thread_id(), 'endpoint_frame')
+			a.endpoint_frame(mut ctx.buffer) or {
+				// Endpoint task finished so we need to reconnect anyway
+				// say that we are shutting down
+				a.shutdown_pool(err, errcode)
 				// TODO we need to free memory here
 				println('endpoint: $err $errcode: finished')
 				return .finished
 			}
 			return .yield
-		}, app, voidptr(&RelayEndpointFrameTaskContext {
+		}, app, voidptr(&RelayEndpointFrameTaskContext{
 			buffer: new_data_buffer()
 		}))
-
-		app.pool.add_task(
-			fn (p &sync2.YieldingPoolProcessor, t &sync2.Task, tid int) sync2.TaskResult {
-				time.sleep(2)
-				mut a := &RelayApp(t.item)
-				a.print_stats()
-
-				return .yield
-			}, app, voidptr(0)
-		)
-
+		// Task for stats
+		app.pool.add_task(fn (t &sync2.Task, tid int) sync2.TaskResult {
+			// sync2.set_thread_desc(sync2.thread_id(), 'stats_frame')
+			time.sleep(1)
+			mut a := &RelayApp(t.item)
+			a.stats.print_stats(a.client_conns.len)
+			return .yield
+		}, app, voidptr(0))
 		// Work and wait for shutdown
 		app.pool.work()
-
 		println('run: pool shutdown finished')
-
 		// Cleanup any connections that might have existed
-		app.endpoint_conn.close() or { }
-		for id, c in app.client_conns {
-			c.close() or { }
-			app.client_conns.delete(id)
+		app.endpoint_conn.close() or {
 		}
+		for id, mut c in app.client_conns {
+			c.close() or {
+			}
+			app.client_conns.delete_1(id)
+		}
+		println('relay: restarting')
 	}
-
 	return none
 }

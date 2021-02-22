@@ -3,3 +3,4 @@
 *.pdb
 .vs/
 .vscode/
+/main
